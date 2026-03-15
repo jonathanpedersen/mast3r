@@ -117,7 +117,8 @@ def convert_dust3r_pairs_naming(imgs, pairs_in):
 
 
 def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc_conf='desc_conf',
-                            kinematic_mode='hclust-ward', device='cuda', dtype=torch.float32, shared_intrinsics=False, **kw):
+                            kinematic_mode='hclust-ward', device='cuda', dtype=torch.float32, shared_intrinsics=False,
+                            car_priors=False, **kw):
     """ Sparse alignment with MASt3R
         imgs: list of image paths
         cache_path: path where to dump temporary files (str)
@@ -188,7 +189,7 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
 
     imgs, res_coarse, res_fine = sparse_scene_optimizer(
         imgs, subsample, imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21, canonical_paths, mst,
-        shared_intrinsics=shared_intrinsics, cache_path=cache_path, device=device, dtype=dtype, **kw)
+        shared_intrinsics=shared_intrinsics, cache_path=cache_path, device=device, dtype=dtype, car_priors=car_priors, **kw)
 
     return SparseGA(imgs, pairs_in, res_fine or res_coarse, anchors, canonical_paths)
 
@@ -204,6 +205,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                            shared_intrinsics=False,
                            init={}, device='cuda', dtype=torch.float32,
                            matching_conf_thr=5., loss_dust3r_w=0.01,
+                           car_priors=False,
                            verbose=True, dbg=()):
     init = copy.deepcopy(init)
     # extrinsic parameters
@@ -428,6 +430,97 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
         return loss / npix if npix != 0 else 0.
 
+    # ── Car motion priors (bicycle model) ─────────────────────────────────
+    # These regularize camera poses assuming a dashcam on a car:
+    #   - No lateral slip: velocity must align with heading (non-holonomic)
+    #   - Planar motion: penalize vertical translation and roll
+    #   - Smooth curvature: penalize jerk in yaw rate (steering dynamics)
+    #   - Smooth speed: penalize sudden acceleration/braking
+    #   - Forward bias: cars generally move forward, not backward
+    car_prior_weights = dict(
+        w_lateral=2.0,     # non-holonomic: no sideways motion
+        w_vertical=1.0,    # planar: no vertical jumps
+        w_roll=0.5,        # planar: no roll
+        w_smooth_yaw=0.5,  # smooth steering
+        w_smooth_speed=0.3,# smooth acceleration
+        w_forward=0.1,     # soft forward-motion bias
+    )
+
+    def loss_car_priors(cam2w):
+        """Regularization loss enforcing car kinematics on the camera trajectory."""
+        N = cam2w.shape[0]
+        if N < 3:
+            return torch.tensor(0.0, device=cam2w.device)
+
+        positions = cam2w[:, :3, 3]       # (N, 3) world positions
+        rotations = cam2w[:, :3, :3]      # (N, 3, 3) rotation matrices
+
+        # Frame-to-frame translation vectors in world space
+        delta_t = positions[1:] - positions[:-1]  # (N-1, 3)
+
+        # Camera forward axis (Z axis of camera = 3rd column of rotation)
+        # and lateral axis (X axis = 1st column)
+        forward = rotations[:-1, :, 2]    # (N-1, 3) forward direction at each frame
+        lateral = rotations[:-1, :, 0]    # (N-1, 3) lateral direction
+        up_axis = rotations[:-1, :, 1]    # (N-1, 3) up direction
+
+        # Speed (magnitude of translation)
+        speed = delta_t.norm(dim=1, keepdim=True).clamp(min=1e-6)  # (N-1, 1)
+
+        # 1. NON-HOLONOMIC: no lateral slip
+        # Project translation onto lateral axis — should be ~0
+        lateral_component = (delta_t * lateral).sum(dim=1)
+        loss_lat = (lateral_component ** 2 / speed.squeeze() ** 2).mean()
+
+        # 2. PLANAR: penalize vertical translation component
+        # Project translation onto camera up axis — should be ~0
+        vertical_component = (delta_t * up_axis).sum(dim=1)
+        loss_vert = (vertical_component ** 2 / speed.squeeze() ** 2).mean()
+
+        # 3. PLANAR: penalize roll (rotation around forward axis)
+        # The camera up vector should stay roughly constant
+        if N >= 2:
+            up_changes = rotations[1:, :, 1] - rotations[:-1, :, 1]
+            loss_roll = (up_changes ** 2).sum(dim=1).mean()
+        else:
+            loss_roll = torch.tensor(0.0, device=cam2w.device)
+
+        # 4. SMOOTH YAW: penalize changes in yaw rate (jerk)
+        if N >= 3:
+            # Yaw = angle of forward vector projected onto ground plane
+            # Use cross product of consecutive forward vectors as yaw rate proxy
+            fwd = forward / forward.norm(dim=1, keepdim=True).clamp(min=1e-6)
+            cross = torch.cross(fwd[:-1], fwd[1:], dim=1)
+            yaw_rate = cross[:, 1]  # Y component = rotation around vertical
+            yaw_jerk = yaw_rate[1:] - yaw_rate[:-1]
+            loss_yaw = (yaw_jerk ** 2).mean()
+        else:
+            loss_yaw = torch.tensor(0.0, device=cam2w.device)
+
+        # 5. SMOOTH SPEED: penalize sudden acceleration
+        if N >= 3:
+            speeds = speed.squeeze()
+            accel = speeds[1:] - speeds[:-1]
+            loss_accel = (accel ** 2 / speeds[:-1].clamp(min=1e-6) ** 2).mean()
+        else:
+            loss_accel = torch.tensor(0.0, device=cam2w.device)
+
+        # 6. FORWARD BIAS: penalize backward motion
+        forward_component = (delta_t * forward).sum(dim=1)
+        loss_fwd = F.relu(-forward_component).mean()  # only penalize negative (backward)
+
+        w = car_prior_weights
+        total = (w['w_lateral'] * loss_lat +
+                 w['w_vertical'] * loss_vert +
+                 w['w_roll'] * loss_roll +
+                 w['w_smooth_yaw'] * loss_yaw +
+                 w['w_smooth_speed'] * loss_accel +
+                 w['w_forward'] * loss_fwd)
+        return total
+
+    if car_priors and verbose:
+        print('Car motion priors ENABLED (bicycle model)')
+
     def optimize_loop(loss_func, lr_base, niter, pix_loss, lr_end=0):
         # create optimizer
         params = pps + log_focals + quats + trans + log_sizes + core_depth
@@ -447,6 +540,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                 pix_loss = ploss(1 - alpha)
                 optimizer.zero_grad()
                 loss = loss_func(K, w2cam, pts3d, pix_loss) + loss_dust3r_w * loss_dust3r(cam2w, pts3d, lossd)
+                if car_priors:
+                    loss = loss + loss_car_priors(cam2w)
                 loss.backward()
                 optimizer.step()
 
