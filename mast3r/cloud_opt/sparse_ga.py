@@ -443,7 +443,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         w_roll=0.5,        # planar: no roll
         w_smooth_yaw=0.5,  # smooth steering
         w_smooth_speed=0.3,# smooth speed changes (symmetric)
-        w_accel_asym=0.5,  # asymmetric: forward accel penalized more than braking
+        w_accel_asym=1.0,  # velocity-aware nonlinear accel penalty
         w_forward=0.1,     # soft forward-motion bias
     )
 
@@ -506,19 +506,46 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         else:
             loss_accel = torch.tensor(0.0, device=cam2w.device)
 
-        # 6. ASYMMETRIC ACCELERATION: forward accel is harder than braking
-        # A typical car can brake at ~0.8-1.0g but only accelerates at ~0.3-0.4g.
-        # We model this by projecting acceleration onto the heading axis and
-        # penalizing positive (speeding up) ~3x more than negative (braking).
+        # 6. VELOCITY-AWARE ACCELERATION: nonlinear penalty that depends on
+        # both acceleration magnitude and current velocity direction.
+        #   - Braking while moving forward: light penalty (normal driving)
+        #   - Accelerating forward: heavy penalty above threshold (cars are slow to speed up)
+        #   - Any backward velocity: very heavy penalty (dashcam never reverses)
         if N >= 3:
-            # Forward speed at each step (signed: positive = forward)
-            fwd_speed = (delta_t * forward).sum(dim=1)  # (N-1,)
-            fwd_accel = fwd_speed[1:] - fwd_speed[:-1]  # (N-2,) positive = speeding up
-            # Asymmetric penalty: accel_ratio ~3 means forward acceleration
-            # is penalized 3x more than braking (reflecting real physics)
-            accel_ratio = 3.0
-            accel_weight = torch.where(fwd_accel > 0, accel_ratio, 1.0)
-            loss_accel_asym = (accel_weight * fwd_accel ** 2).mean()
+            fwd_speed = (delta_t * forward).sum(dim=1)        # (N-1,) signed speed
+            fwd_accel = fwd_speed[1:] - fwd_speed[:-1]        # (N-2,)
+            cur_speed = fwd_speed[:-1]                         # (N-2,) speed at each step
+
+            # Thresholds (in per-frame units, ~0.1s per frame at 10fps)
+            accel_thresh = 0.02   # ~2 m/s² — normal forward acceleration limit
+            brake_thresh = 0.08   # ~8 m/s² — hard braking limit
+
+            moving_forward = cur_speed > 0.01
+            speeding_up = fwd_accel > 0
+            slowing_down = fwd_accel < 0
+
+            # Case 1: Moving forward + speeding up → heavy nonlinear above threshold
+            fwd_accel_excess = F.relu(fwd_accel - accel_thresh)
+            cost_fwd_accel = fwd_accel ** 2 + 10.0 * fwd_accel_excess ** 3
+
+            # Case 2: Moving forward + braking → light quadratic, gentle above threshold
+            brake_mag = (-fwd_accel).clamp(min=0)
+            brake_excess = F.relu(brake_mag - brake_thresh)
+            cost_brake = 0.1 * brake_mag ** 2 + brake_excess ** 2
+
+            # Case 3: Backward velocity → penalize high reverse speed, not existence
+            # Slow reverse (parking) is fine, fast reverse is wrong
+            reverse_speed = F.relu(-cur_speed)
+            reverse_thresh = 0.01  # ~1 m/s — slow reverse OK
+            cost_reverse = reverse_speed ** 2 + 5.0 * F.relu(reverse_speed - reverse_thresh) ** 3
+
+            # Combine: pick the right cost based on direction
+            per_step_cost = torch.where(
+                moving_forward & speeding_up, cost_fwd_accel,
+                torch.where(moving_forward & slowing_down, cost_brake,
+                             cost_fwd_accel)  # not moving forward = penalize like accel
+            )
+            loss_accel_asym = per_step_cost.mean() + cost_reverse.mean()
         else:
             loss_accel_asym = torch.tensor(0.0, device=cam2w.device)
 
