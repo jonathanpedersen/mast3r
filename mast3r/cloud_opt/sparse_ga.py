@@ -442,7 +442,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         w_vertical=1.0,    # planar: no vertical jumps
         w_roll=0.5,        # planar: no roll
         w_smooth_yaw=0.5,  # smooth steering
-        w_smooth_speed=0.3,# smooth acceleration
+        w_smooth_speed=0.3,# smooth speed changes (symmetric)
+        w_accel_asym=0.5,  # asymmetric: forward accel penalized more than braking
         w_forward=0.1,     # soft forward-motion bias
     )
 
@@ -497,7 +498,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         else:
             loss_yaw = torch.tensor(0.0, device=cam2w.device)
 
-        # 5. SMOOTH SPEED: penalize sudden acceleration
+        # 5. SMOOTH SPEED: penalize sudden speed changes (symmetric)
         if N >= 3:
             speeds = speed.squeeze()
             accel = speeds[1:] - speeds[:-1]
@@ -505,7 +506,23 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         else:
             loss_accel = torch.tensor(0.0, device=cam2w.device)
 
-        # 6. FORWARD BIAS: penalize backward motion
+        # 6. ASYMMETRIC ACCELERATION: forward accel is harder than braking
+        # A typical car can brake at ~0.8-1.0g but only accelerates at ~0.3-0.4g.
+        # We model this by projecting acceleration onto the heading axis and
+        # penalizing positive (speeding up) ~3x more than negative (braking).
+        if N >= 3:
+            # Forward speed at each step (signed: positive = forward)
+            fwd_speed = (delta_t * forward).sum(dim=1)  # (N-1,)
+            fwd_accel = fwd_speed[1:] - fwd_speed[:-1]  # (N-2,) positive = speeding up
+            # Asymmetric penalty: accel_ratio ~3 means forward acceleration
+            # is penalized 3x more than braking (reflecting real physics)
+            accel_ratio = 3.0
+            accel_weight = torch.where(fwd_accel > 0, accel_ratio, 1.0)
+            loss_accel_asym = (accel_weight * fwd_accel ** 2).mean()
+        else:
+            loss_accel_asym = torch.tensor(0.0, device=cam2w.device)
+
+        # 7. FORWARD BIAS: penalize backward motion
         forward_component = (delta_t * forward).sum(dim=1)
         loss_fwd = F.relu(-forward_component).mean()  # only penalize negative (backward)
 
@@ -515,6 +532,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                  w['w_roll'] * loss_roll +
                  w['w_smooth_yaw'] * loss_yaw +
                  w['w_smooth_speed'] * loss_accel +
+                 w['w_accel_asym'] * loss_accel_asym +
                  w['w_forward'] * loss_fwd)
         return total
 
