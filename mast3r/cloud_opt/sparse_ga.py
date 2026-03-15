@@ -439,7 +439,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     #   - Forward bias: cars generally move forward, not backward
     car_prior_weights = dict(
         w_lateral=2.0,     # non-holonomic: no sideways motion
-        w_vertical=1.0,    # planar: no vertical jumps
+        w_vertical=0.1,    # light penalty: car may be on a hill
         w_roll=0.5,        # planar: no roll
         w_smooth_yaw=0.5,  # smooth steering
         w_smooth_speed=0.3,# smooth speed changes (symmetric)
