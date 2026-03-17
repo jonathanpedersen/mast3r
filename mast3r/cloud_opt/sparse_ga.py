@@ -430,6 +430,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
         return loss / npix if npix != 0 else 0.
 
+<<<<<<< HEAD
     # ── Car motion priors (bicycle model) ─────────────────────────────────
     # These regularize camera poses assuming a dashcam on a car:
     #   - No lateral slip: velocity must align with heading (non-holonomic)
@@ -566,7 +567,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     if car_priors and verbose:
         print('Car motion priors ENABLED (bicycle model)')
 
-    def optimize_loop(loss_func, lr_base, niter, pix_loss, lr_end=0):
+    def optimize_loop(loss_func, lr_base, niter, pix_loss, lr_end=0, loss_log=None):
         # create optimizer
         params = pps + log_focals + quats + trans + log_sizes + core_depth
         optimizer = torch.optim.Adam(params, lr=1, weight_decay=0, betas=(0.9, 0.9))
@@ -597,6 +598,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                 loss = float(loss)
                 if loss != loss:
                     break  # NaN loss
+                if loss_log is not None:
+                    loss_log.append(loss)
                 bar.set_postfix_str(f'{lr=:.4f}, {loss=:.3f}')
                 bar.update(1)
 
@@ -615,7 +618,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         log_sizes[i].requires_grad_(trainable)
         core_depth[i].requires_grad_(False)
 
-    res_coarse = optimize_loop(loss_3d, lr_base=lr1, niter=niter1, pix_loss=loss1)
+    losses_coarse, losses_fine = [], []
+    res_coarse = optimize_loop(loss_3d, lr_base=lr1, niter=niter1, pix_loss=loss1, loss_log=losses_coarse)
 
     res_fine = None
     if niter2:
@@ -628,7 +632,38 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             core_depth[i].requires_grad_(opt_depth)
 
         # refinement with 2d reproj
-        res_fine = optimize_loop(loss_2d, lr_base=lr2, niter=niter2, pix_loss=loss2)
+        res_fine = optimize_loop(loss_2d, lr_base=lr2, niter=niter2, pix_loss=loss2, loss_log=losses_fine)
+
+    # ── Training curves ───────────────────────────────────────────────────────
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from pathlib import Path as _Path
+        out_dir = _Path(cache_path).parent
+        n_plots = 1 + (1 if losses_fine else 0)
+        fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 4))
+        if n_plots == 1:
+            axes = [axes]
+        fig.suptitle("MASt3R Pose Optimisation", fontsize=12)
+        axes[0].plot(losses_coarse, color="#26c8f0", linewidth=1.0)
+        axes[0].set_title(f"Coarse — 3D matching  ({len(losses_coarse)} steps)")
+        axes[0].set_xlabel("Step")
+        axes[0].set_ylabel("Loss")
+        axes[0].grid(True, alpha=0.3)
+        if losses_fine:
+            axes[1].plot(losses_fine, color="#f07826", linewidth=1.0)
+            axes[1].set_title(f"Fine — 2D reprojection  ({len(losses_fine)} steps)")
+            axes[1].set_xlabel("Step")
+            axes[1].set_ylabel("Loss")
+            axes[1].grid(True, alpha=0.3)
+        plt.tight_layout()
+        plot_path = out_dir / "mast3r_training.png"
+        plt.savefig(str(plot_path), dpi=120, bbox_inches="tight")
+        plt.close()
+        print(f"Training curves saved → {plot_path}")
+    except Exception as e:
+        print(f"Warning: could not save MASt3R training curves — {e}")
 
     K = make_K_cam_depth(log_focals, pps, None, None, None, None)
     if shared_intrinsics:
