@@ -118,7 +118,7 @@ def convert_dust3r_pairs_naming(imgs, pairs_in):
 
 def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc_conf='desc_conf',
                             kinematic_mode='hclust-ward', device='cuda', dtype=torch.float32, shared_intrinsics=False,
-                            car_priors=False, **kw):
+                            car_priors=False, static_masks=None, **kw):
     """ Sparse alignment with MASt3R
         imgs: list of image paths
         cache_path: path where to dump temporary files (str)
@@ -140,8 +140,10 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
         prepare_canonical_data(imgs, pairs, subsample, cache_path=cache_path, mode='avg-angle', device=device)
 
     # smartly combine all useful data
+    debug_dir = os.path.join(cache_path, 'debug_corres') if static_masks else None
     imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21 = \
-        condense_data(imgs, tmp_pairs, canonical_views, preds_21, dtype)
+        condense_data(imgs, tmp_pairs, canonical_views, preds_21, dtype,
+                      static_masks=static_masks, debug_dir=debug_dir)
 
     # Build kinematic chain
     if kinematic_mode == 'mst':
@@ -430,7 +432,6 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
         return loss / npix if npix != 0 else 0.
 
-<<<<<<< HEAD
     # ── Car motion priors (bicycle model) ─────────────────────────────────
     # These regularize camera poses assuming a dashcam on a car:
     #   - No lateral slip: velocity must align with heading (non-holonomic)
@@ -939,7 +940,110 @@ PairOfSlices = namedtuple(
     'ImgPair', 'img1, slice1, pix1, anchor_idxs1, img2, slice2, pix2, anchor_idxs2, confs, confs_sum')
 
 
-def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float32):
+def _mask_confidence(pix, mask_tensor):
+    """Given pixel coords (N, 2) in MASt3R image space and a mask (H, W) where
+    1.0 = static (keep) and 0.0 = dynamic (suppress), return per-pixel weights.
+    Pixels outside the mask bounds get weight 1.0 (keep).
+    """
+    if mask_tensor is None:
+        return None
+    x = pix[:, 0].long()
+    y = pix[:, 1].long()
+    H, W = mask_tensor.shape
+    valid = (x >= 0) & (x < W) & (y >= 0) & (y < H)
+    weights = torch.ones(len(pix), device=pix.device, dtype=pix.dtype)
+    weights[valid] = mask_tensor[y[valid], x[valid]].to(pix.dtype)
+    return weights
+
+
+def _save_corres_debug(debug_dir, img1_path, img2_path, img1_idx, img2_idx,
+                       pix1, pix2, mask_weights, mask1, mask2,
+                       n_total, n_suppressed, max_pairs=20):
+    """Save a debug image for one pair showing correspondences colored by mask status.
+
+    Green lines = kept (static), Red lines = suppressed (dynamic).
+    Background shows the mask overlay on each frame.
+    """
+    import os
+    os.makedirs(debug_dir, exist_ok=True)
+
+    # Only save for the first max_pairs pairs to avoid flooding disk
+    existing = len([f for f in os.listdir(debug_dir) if f.startswith('corres_')])
+    if existing >= max_pairs:
+        return
+
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return
+
+    try:
+        # Load original frames and resize to mask dimensions
+        frame1 = cv2.imread(img1_path)
+        frame2 = cv2.imread(img2_path)
+        if frame1 is None or frame2 is None:
+            return
+
+        H, W = mask1.shape if mask1 is not None else mask2.shape
+
+        frame1 = cv2.resize(frame1, (W, H))
+        frame2 = cv2.resize(frame2, (W, H))
+
+        # Overlay mask: red tint on dynamic (mask < 0.5) regions
+        for frame, mask in [(frame1, mask1), (frame2, mask2)]:
+            if mask is not None:
+                mask_np = mask.cpu().numpy() if hasattr(mask, 'cpu') else mask
+                dynamic = mask_np < 0.5
+                frame[dynamic] = (0.5 * frame[dynamic] +
+                                  0.5 * np.array([0, 0, 180], dtype=np.float64)).astype(np.uint8)
+
+        # Side-by-side canvas
+        canvas = np.hstack([frame1, frame2])
+
+        # Draw correspondences (subsample to max 200 for readability)
+        pix1_np = pix1.cpu().numpy() if hasattr(pix1, 'cpu') else pix1
+        pix2_np = pix2.cpu().numpy() if hasattr(pix2, 'cpu') else pix2
+        weights_np = mask_weights.cpu().numpy() if hasattr(mask_weights, 'cpu') else mask_weights
+
+        n = len(pix1_np)
+        step = max(1, n // 200)
+        for i in range(0, n, step):
+            x1, y1 = int(pix1_np[i, 0]), int(pix1_np[i, 1])
+            x2, y2 = int(pix2_np[i, 0]) + W, int(pix2_np[i, 1])  # offset for right image
+            kept = weights_np[i] > 0.5
+            color = (0, 200, 0) if kept else (0, 0, 200)  # green=kept, red=suppressed
+            thickness = 1
+            cv2.line(canvas, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
+            cv2.circle(canvas, (x1, y1), 2, color, -1)
+            cv2.circle(canvas, (x2, y2), 2, color, -1)
+
+        # Stats bar
+        bar_h = 35
+        bar = np.zeros((bar_h, canvas.shape[1], 3), dtype=np.uint8)
+        text = (f'Pair {img1_idx}-{img2_idx}: {n_total} total, '
+                f'{n_suppressed} suppressed ({100*n_suppressed/max(n_total,1):.0f}%) | '
+                f'GREEN=kept  RED=suppressed  RED_TINT=dynamic_mask')
+        cv2.putText(bar, text, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (220, 220, 220), 1, cv2.LINE_AA)
+        canvas = np.vstack([bar, canvas])
+
+        out_path = os.path.join(debug_dir, f'corres_{img1_idx:03d}_{img2_idx:03d}.png')
+        cv2.imwrite(out_path, canvas)
+    except Exception as e:
+        print(f'  [debug] Failed to save correspondence debug: {e}')
+
+
+def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float32,
+                  static_masks=None, debug_dir=None):
+    """Aggregate correspondence data.
+
+    static_masks: optional dict {img_path: (H, W) tensor} where 1.0 = static pixel,
+                  0.0 = dynamic pixel. Correspondences landing on dynamic pixels get
+                  their confidence zeroed out so the optimizer ignores them.
+                  Masks should be at MASt3R image resolution (e.g. 512px).
+    debug_dir:    optional path — if provided, saves correspondence debug images.
+    """
     # aggregate all data properly
     set_imgs = set(imgs)
 
@@ -986,9 +1090,42 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
             pix2, confs2, slice2 = tmp_pixels[img2, img1]
         except KeyError:
             continue
+        img1_path = img1  # save path before overwriting with index
+        img2_path = img2
         img1 = imgs.index(img1)
         img2 = imgs.index(img2)
         confs = (confs1 * confs2).sqrt()
+
+        # Apply dynamic mask weighting: zero out confidence for correspondences
+        # where either endpoint lands on a dynamic (masked) pixel
+        if static_masks is not None:
+            n_before = int((confs > 0).sum())
+            m1 = static_masks.get(img1_path)
+            m2 = static_masks.get(img2_path)
+            w1 = _mask_confidence(pix1, m1)
+            w2 = _mask_confidence(pix2, m2)
+            if w1 is not None and w2 is not None:
+                mask_weights = (w1 * w2).sqrt()
+                confs = confs * mask_weights
+            elif w1 is not None:
+                mask_weights = w1
+                confs = confs * w1
+            elif w2 is not None:
+                mask_weights = w2
+                confs = confs * w2
+            else:
+                mask_weights = None
+            n_after = int((confs > 0).sum())
+            n_suppressed = n_before - n_after
+            if n_suppressed > 0:
+                print(f'  Pair {img1}-{img2}: {n_suppressed}/{n_before} correspondences '
+                      f'suppressed by mask ({100*n_suppressed/max(n_before,1):.0f}%)')
+
+            # Save debug visualizations for selected pairs
+            if debug_dir and mask_weights is not None and n_before > 0:
+                _save_corres_debug(debug_dir, img1_path, img2_path, img1, img2,
+                                   pix1, pix2, mask_weights, m1, m2,
+                                   n_before, n_suppressed)
 
         # prepare for loss_3d
         all_confs.append(confs)
