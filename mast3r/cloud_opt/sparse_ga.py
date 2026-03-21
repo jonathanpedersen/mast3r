@@ -118,7 +118,7 @@ def convert_dust3r_pairs_naming(imgs, pairs_in):
 
 def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc_conf='desc_conf',
                             kinematic_mode='hclust-ward', device='cuda', dtype=torch.float32, shared_intrinsics=False,
-                            car_priors=False, static_masks=None, **kw):
+                            car_priors=False, static_masks=None, tilt_degrees=0.0, **kw):
     """ Sparse alignment with MASt3R
         imgs: list of image paths
         cache_path: path where to dump temporary files (str)
@@ -191,7 +191,7 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
 
     imgs, res_coarse, res_fine = sparse_scene_optimizer(
         imgs, subsample, imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21, canonical_paths, mst,
-        shared_intrinsics=shared_intrinsics, cache_path=cache_path, device=device, dtype=dtype, car_priors=car_priors, **kw)
+        shared_intrinsics=shared_intrinsics, cache_path=cache_path, device=device, dtype=dtype, car_priors=car_priors, tilt_degrees=tilt_degrees, **kw)
 
     return SparseGA(imgs, pairs_in, res_fine or res_coarse, anchors, canonical_paths)
 
@@ -207,7 +207,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                            shared_intrinsics=False,
                            init={}, device='cuda', dtype=torch.float32,
                            matching_conf_thr=5., loss_dust3r_w=0.01,
-                           car_priors=False,
+                           car_priors=False, tilt_degrees=0.0,
                            verbose=True, dbg=()):
     init = copy.deepcopy(init)
     # extrinsic parameters
@@ -457,6 +457,20 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
         positions = cam2w[:, :3, 3]       # (N, 3) world positions
         rotations = cam2w[:, :3, :3]      # (N, 3, 3) rotation matrices
+
+        # Apply tilt correction: rotate from tilted-camera frame to level-car frame
+        # The correction rotates around the camera's forward (Z) axis
+        if tilt_degrees != 0.0:
+            theta = tilt_degrees * 3.141592653589793 / 180.0
+            c, s = torch.cos(torch.tensor(theta, device=cam2w.device)), \
+                   torch.sin(torch.tensor(theta, device=cam2w.device))
+            # Rotation matrix around Z axis (negative theta to undo the tilt)
+            R_correct = torch.tensor([
+                [c,  s, 0],
+                [-s, c, 0],
+                [0,  0, 1],
+            ], device=cam2w.device, dtype=cam2w.dtype)
+            rotations = rotations @ R_correct  # (N, 3, 3) corrected
 
         # Frame-to-frame translation vectors in world space
         delta_t = positions[1:] - positions[:-1]  # (N-1, 3)
