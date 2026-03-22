@@ -966,7 +966,7 @@ def _mask_confidence(pix, mask_tensor):
     H, W = mask_tensor.shape
     valid = (x >= 0) & (x < W) & (y >= 0) & (y < H)
     weights = torch.ones(len(pix), device=pix.device, dtype=pix.dtype)
-    weights[valid] = mask_tensor[y[valid], x[valid]].to(pix.dtype)
+    weights[valid] = mask_tensor[y[valid].cpu(), x[valid].cpu()].to(pix.device).to(pix.dtype)
     return weights
 
 
